@@ -1,32 +1,37 @@
 # ==========================================================
-# STABLE RAG FOR SDN ATTACK ANALYSIS (RYU / ODL)
-# Threat-Intelligence-Oriented (NO mitigation)
+# UNIFIED RAG FOR SDN ATTACK ANALYSIS
+# Supports:
+#   - Controller logs (.log)
+#   - Wireshark CSVs (.csv)
+# Controllers: RYU / ODL
+# Focus: Threat intelligence & cross-plane reasoning
 # ==========================================================
 
 import os
+import csv
+import pandas as pd
+
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_groq import ChatGroq
 
 # ----------------------------------------------------------
-# CONFIG
+# CONFIGURATION
 # ----------------------------------------------------------
 
-BASE_LOG_DIR = "/home/akhil/Desktop/Attacks/Ryu"   # change if needed
+BASE_DATA_DIR = "/home/akhil/Desktop/Attacks/Ryu"
 VECTOR_DB_DIR = "./sdn_vector_db"
 COLLECTION_NAME = "sdn_attack_knowledge"
-
-# ✅ Supported Groq model (70B removed by Groq)
-MODEL_NAME = "llama-3.1-8b-instant"
+MODEL_NAME = "llama-3.1-8b-instant"   # supported Groq model
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ----------------------------------------------------------
-# SIMPLE TEXT SPLITTER (LOG SAFE)
+# SIMPLE TEXT SPLITTER (NO EXTRA DEPENDENCIES)
 # ----------------------------------------------------------
 
-def simple_split(text, max_len=500):
+def split_text(text, max_len=500):
     chunks, buf = [], ""
     for line in text.splitlines():
         if len(buf) + len(line) <= max_len:
@@ -39,11 +44,21 @@ def simple_split(text, max_len=500):
     return chunks
 
 # ----------------------------------------------------------
-# LOAD SINGLE CONTROLLER LOG
+# LOAD CONTROLLER LOG FILES (.log)
 # ----------------------------------------------------------
 
-def load_controller_log(path, attack, controller="ryu"):
+def load_controller_log(path):
     docs = []
+
+    fname = os.path.basename(path).lower()
+    if "dos" in fname:
+        attack = "dos"
+    elif "arp" in fname:
+        attack = "arp_spoofing"
+    elif "flow" in fname:
+        attack = "flow_rule_poisoning"
+    else:
+        attack = "unknown"
 
     with open(path, "r", errors="ignore") as f:
         for line in f:
@@ -53,19 +68,19 @@ def load_controller_log(path, attack, controller="ryu"):
 
             text = f"""
 ATTACK: {attack}
-CONTROLLER: {controller}
-PLANE: CONTROL
+SOURCE: Controller Log
+PLANE: Control
 LOG: {line}
 """
 
-            for chunk in simple_split(text):
+            for chunk in split_text(text):
                 docs.append(
                     Document(
                         page_content=chunk,
                         metadata={
                             "attack": attack,
-                            "controller": controller,
-                            "plane": "control"
+                            "plane": "control",
+                            "source": "controller_log"
                         }
                     )
                 )
@@ -73,42 +88,80 @@ LOG: {line}
     return docs
 
 # ----------------------------------------------------------
-# LOAD ALL LOGS FROM DIRECTORY
+# LOAD WIRESHARK CSV FILES (.csv)
 # ----------------------------------------------------------
 
-def load_all_logs(base_dir):
-    all_docs = []
+def load_wireshark_csv(path):
+    docs = []
+
+    fname = os.path.basename(path).lower()
+    if "arp" in fname:
+        attack = "arp_spoofing"
+    elif "flow" in fname:
+        attack = "flow_rule_poisoning"
+    elif "dos" in fname:
+        attack = "dos"
+    else:
+        attack = "unknown"
+
+    try:
+        df = pd.read_csv(path, engine="python", quoting=csv.QUOTE_NONE, on_bad_lines="skip")
+    except Exception as e:
+        print(f"[!] Failed to read CSV {path}: {e}")
+        return docs
+
+    for _, row in df.iterrows():
+        row_text = "\n".join([f"{k}: {row[k]}" for k in row.index])
+
+        text = f"""
+ATTACK: {attack}
+SOURCE: Wireshark CSV
+PLANE: Data
+{row_text}
+"""
+
+        for chunk in split_text(text):
+            docs.append(
+                Document(
+                    page_content=chunk,
+                    metadata={
+                        "attack": attack,
+                        "plane": "data",
+                        "source": "pcap_csv"
+                    }
+                )
+            )
+
+    return docs
+
+# ----------------------------------------------------------
+# LOAD ALL DATA (LOG + CSV)
+# ----------------------------------------------------------
+
+def load_all_data(base_dir):
+    documents = []
+
+    print("[+] Loading attack artifacts")
 
     for file in os.listdir(base_dir):
-        if not file.endswith(".log"):
-            continue
+        full_path = os.path.join(base_dir, file)
 
-        full = os.path.join(base_dir, file)
-        name = file.lower()
+        if file.endswith(".log"):
+            print(f"[+] LOG: {full_path}")
+            documents += load_controller_log(full_path)
 
-        attack = "unknown"
-        if "dos" in name:
-            attack = "dos"
-        elif "arp" in name:
-            attack = "arp_spoofing"
-        elif "flow" in name:
-            attack = "flow_rule_poisoning"
+        elif file.endswith(".csv"):
+            print(f"[+] CSV: {full_path}")
+            documents += load_wireshark_csv(full_path)
 
-        print(f"[+] LOG: {full}")
-        all_docs += load_controller_log(full, attack)
-
-    return all_docs
+    return documents
 
 # ----------------------------------------------------------
-# RAG QUESTION ANSWERING (NO CHAINS)
+# MANUAL RAG QUERY (NO DEPRECATED CHAINS)
 # ----------------------------------------------------------
 
 def ask_rag(llm, retriever, query):
-    # ✅ Correct retriever call (new API)
     docs = retriever.invoke(query)
-
-    if not docs:
-        return "No relevant evidence found in controller logs."
 
     context = "\n\n".join(
         f"[{i+1}] {d.page_content}" for i, d in enumerate(docs)
@@ -117,9 +170,8 @@ def ask_rag(llm, retriever, query):
     prompt = f"""
 You are an SDN security researcher.
 
-Answer ONLY using the provided controller logs.
-Do NOT guess.
-If evidence is missing, explicitly say so.
+Answer the question STRICTLY using the provided context.
+If evidence is insufficient, clearly state that.
 
 CONTEXT:
 {context}
@@ -130,21 +182,20 @@ QUESTION:
 ANSWER:
 """
 
-    return llm.invoke(prompt).content
+    return llm.invoke(prompt)
 
 # ----------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------
 
 def main():
-    print("[+] Loading controller logs")
-    documents = load_all_logs(BASE_LOG_DIR)
+    documents = load_all_data(BASE_DATA_DIR)
 
     if not documents:
-        print("[!] No logs found.")
+        print("[!] No data found.")
         return
 
-    print(f"[+] Total log chunks indexed: {len(documents)}")
+    print(f"[+] Total chunks indexed: {len(documents)}")
 
     embeddings = FastEmbedEmbeddings()
 
@@ -155,7 +206,7 @@ def main():
         collection_name=COLLECTION_NAME
     )
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
 
     llm = ChatGroq(
         model_name=MODEL_NAME,
@@ -172,7 +223,7 @@ def main():
                 continue
 
             ans = ask_rag(llm, retriever, q)
-            print("\nANSWER:\n", ans)
+            print("\nANSWER:\n", ans.content)
             print("\n" + "=" * 70)
 
         except KeyboardInterrupt:
